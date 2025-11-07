@@ -26,6 +26,12 @@
  *   - Comprehensive error handling
  *   - Custom FTP command execution
  *
+ * THREAD SAFETY:
+ *   The ftp_client_t handle is NOT thread-safe. A single client handle should not
+ *   be used from multiple threads simultaneously without external synchronization.
+ *   However, it is safe to create and use separate ftp_client_t handles in different
+ *   threads concurrently.
+ *
  * DEPENDENCIES:
  *   libcurl (7.20.0 or later)
  *
@@ -234,7 +240,7 @@ extern "C"
 	 * config.port = 2121;
 	 * @endcode
 	 */
-	void ftp_client_init_config(ftp_config_t *config);
+	int ftp_client_init_config(ftp_config_t *config);
 
 	/**
 	 * @brief Set FTP server connection parameters
@@ -400,7 +406,7 @@ extern "C"
 	 *         FTP_ERROR_TIMEOUT (-10) if connection times out
 	 *         FTP_ERROR_CONNECTION (-2) for other connection errors
 	 *
-	 * @note This function lists the root directory to verify the connection.
+	 * @note This function executes a NOOP command to verify the connection.
 	 *       Use ftp_client_get_error() to retrieve detailed error messages.
 	 *
 	 * Example:
@@ -509,7 +515,8 @@ extern "C"
 	 *         FTP_ERROR_INVALID_PARAM (-7) if any parameter is NULL
 	 *         FTP_ERROR_TRANSFER (-4) if directory creation fails
 	 *
-	 * @note This function operates on absolute paths from the FTP root.
+	 * @note Paths are sent to the server as-is. Use a leading '/' for absolute
+	 *       paths from the FTP root, or provide relative paths otherwise.
 	 *       Parent directories must exist. This function does not create
 	 *       intermediate directories recursively. Some servers may return
 	 *       an error if the directory already exists.
@@ -536,7 +543,8 @@ extern "C"
 	 *         FTP_ERROR_INVALID_PARAM (-7) if any parameter is NULL
 	 *         FTP_ERROR_TRANSFER (-4) if removal fails
 	 *
-	 * @note This function operates on absolute paths from the FTP root.
+	 * @note Paths are sent to the server as-is. Use a leading '/' for absolute
+	 *       paths from the FTP root, or provide relative paths otherwise.
 	 *       The directory must be empty before it can be removed.
 	 *       Use ftp_client_delete() to remove files first if needed.
 	 *
@@ -562,7 +570,8 @@ extern "C"
 	 *         FTP_ERROR_INVALID_PARAM (-7) if any parameter is NULL
 	 *         FTP_ERROR_TRANSFER (-4) if deletion fails
 	 *
-	 * @note This function operates on absolute paths from the FTP root.
+	 * @note Paths are sent to the server as-is. Use a leading '/' for absolute
+	 *       paths from the FTP root, or provide relative paths otherwise.
 	 *       This operation is permanent and cannot be undone.
 	 *       To remove directories, use ftp_client_rmdir() instead.
 	 *
@@ -589,7 +598,9 @@ extern "C"
 	 *         FTP_ERROR_INVALID_PARAM (-7) if any parameter is NULL
 	 *         FTP_ERROR_TRANSFER (-4) if rename fails
 	 *
-	 * @note This can be used to move files between directories if the server
+	 * @note Paths are sent to the server as-is. Use a leading '/' for absolute
+	 *       paths from the FTP root, or provide relative paths otherwise.
+	 *       This can be used to move files between directories if the server
 	 *       supports it. The destination directory must exist. If a file with
 	 *       the new name already exists, behavior depends on the server.
 	 *
@@ -759,31 +770,53 @@ extern "C"
 	{
 		const char *protocol = "ftp";
 
-		/*
-		 * Calculate required space: protocol (3) + "://" (3) + host (256) + ":" (1) + port (5) + "/" (1) + path + null
-		 */
-		size_t base_len = strlen(protocol) + 3 + strlen(client->config.host) + 1 + 5 + 1;
-		size_t path_len = remote_path ? strlen(remote_path) : 0;
-		size_t required_len = base_len + path_len + 1; /* +1 for null terminator */
-
-		/* Check if URL will fit */
-		if (required_len > url_size)
+		if (!client->config.host)
 		{
-			return FTP_ERROR_INVALID_PARAM; /* URL too long */
+			return FTP_ERROR_INVALID_PARAM;
 		}
 
-		/* Build the URL */
+		size_t host_len = strlen(client->config.host);
+		if (host_len == 0 || host_len > 255)
+		{
+			return FTP_ERROR_INVALID_PARAM;
+		}
+
+		for (size_t i = 0; i < host_len; i++)
+		{
+			char c = client->config.host[i];
+			if (c == '\0' || c == '/' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
+			{
+				return FTP_ERROR_INVALID_PARAM;
+			}
+		}
+
+		size_t base_len = strlen(protocol) + 3 + host_len + 6; /* 6 chars max for port (65535) */
+		size_t path_len = remote_path ? strlen(remote_path) : 0;
+		size_t required_len = base_len + path_len + 1;
+
+		if (required_len > url_size)
+		{
+			return FTP_ERROR_INVALID_PARAM;
+		}
+
+		int written;
 		if (remote_path && remote_path[0] == '/')
 		{
-			snprintf(url, url_size, "%s://%s:%d%s", protocol, client->config.host, client->config.port, remote_path);
+			written = snprintf(url, url_size, "%s://%s:%d%s", protocol, client->config.host, client->config.port, remote_path);
 		}
 		else if (remote_path)
 		{
-			snprintf(url, url_size, "%s://%s:%d/%s", protocol, client->config.host, client->config.port, remote_path);
+			written = snprintf(url, url_size, "%s://%s:%d/%s", protocol, client->config.host, client->config.port, remote_path);
 		}
 		else
 		{
-			snprintf(url, url_size, "%s://%s:%d/", protocol, client->config.host, client->config.port);
+			written = snprintf(url, url_size, "%s://%s:%d/", protocol, client->config.host, client->config.port);
+		}
+
+		/* Check if truncation occurred */
+		if (written < 0 || (size_t)written >= url_size)
+		{
+			return FTP_ERROR_INVALID_PARAM;
 		}
 
 		return FTP_OK;
@@ -836,10 +869,8 @@ extern "C"
 			return FTP_ERROR_INVALID_PARAM;
 		}
 
-		/* Reset curl handle to default state */
 		curl_easy_reset(client->curl);
 
-		/* Use base URL for command execution */
 		char url[FTP_MAX_URL_LENGTH];
 		int result = build_ftp_url(client, "/", url, sizeof(url));
 		if (result != FTP_OK)
@@ -866,13 +897,20 @@ extern "C"
 		if (res != CURLE_OK)
 		{
 			snprintf(client->last_error, sizeof(client->last_error), "%s: %s", error_prefix, curl_easy_strerror(res));
+
+			if (res == CURLE_LOGIN_DENIED)
+			{
+				return FTP_ERROR_AUTH;
+			}
+			else if (res == CURLE_OPERATION_TIMEDOUT)
+			{
+				return FTP_ERROR_TIMEOUT;
+			}
 			return FTP_ERROR_TRANSFER;
 		}
 
 		return FTP_OK;
 	}
-
-	/* API Implementation */
 
 	int ftp_global_init(void)
 	{
@@ -900,42 +938,81 @@ extern "C"
 			return NULL;
 		}
 
-		/* Initialize with defaults */
-		ftp_client_init_config(&client->config);
+		if (ftp_client_init_config(&client->config) != FTP_OK)
+		{
+			curl_easy_cleanup(client->curl);
+			free(client);
+			return NULL;
+		}
 		return client;
 	}
 
-	void ftp_client_init_config(ftp_config_t *config)
+	int ftp_client_init_config(ftp_config_t *config)
 	{
 		memset(config, 0, sizeof(ftp_config_t));
 		config->host = NULL;
 		config->port = 21;
 		config->username = strdup("anonymous");
 		config->password = strdup("user@example.com");
+
+		if (!config->username || !config->password)
+		{
+			free(config->username);
+			free(config->password);
+			return FTP_ERROR_MEMORY;
+		}
+
 		config->mode = FTP_MODE_PASSIVE;
 		config->ssl_mode = FTP_SSL_NONE;
 		config->verify_ssl = 1;
 		config->timeout = 60;
 		config->connect_timeout = 30;
 		config->verbose = 0;
+		return FTP_OK;
 	}
 
 	int ftp_client_set_host(ftp_client_t *client, const char *host, int port)
 	{
-		if (!client || !host)
+		if (!client)
 		{
 			return FTP_ERROR_INVALID_PARAM;
+		}
+		if (!host)
+		{
+			snprintf(client->last_error, sizeof(client->last_error), "Host parameter is NULL");
+			return FTP_ERROR_INVALID_PARAM;
+		}
+
+		size_t host_len = strlen(host);
+		if (host_len == 0 || host_len > 255)
+		{
+			snprintf(client->last_error, sizeof(client->last_error),
+					 "Host length must be between 1 and 255 characters");
+			return FTP_ERROR_INVALID_PARAM;
+		}
+
+		for (size_t i = 0; i < host_len; i++)
+		{
+			char c = host[i];
+			if (c == '\0' || c == '/' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
+			{
+				snprintf(client->last_error, sizeof(client->last_error), "Host contains invalid characters");
+				return FTP_ERROR_INVALID_PARAM;
+			}
+		}
+
+		char *new_host = strdup(host);
+		if (!new_host)
+		{
+			snprintf(client->last_error, sizeof(client->last_error), "Failed to allocate memory for host");
+			return FTP_ERROR_MEMORY;
 		}
 
 		if (client->config.host)
 		{
 			free(client->config.host);
 		}
-		client->config.host = strdup(host);
-		if (!client->config.host)
-		{
-			return FTP_ERROR_MEMORY;
-		}
+		client->config.host = new_host;
 
 		if (port > 0 && port <= 65535)
 		{
@@ -947,32 +1024,66 @@ extern "C"
 
 	int ftp_client_set_credentials(ftp_client_t *client, const char *username, const char *password)
 	{
-		if (!client || !username || !password)
+		if (!client)
 		{
 			return FTP_ERROR_INVALID_PARAM;
 		}
+		if (!username)
+		{
+			snprintf(client->last_error, sizeof(client->last_error), "Username parameter is NULL");
+			return FTP_ERROR_INVALID_PARAM;
+		}
+		if (!password)
+		{
+			snprintf(client->last_error, sizeof(client->last_error), "Password parameter is NULL");
+			return FTP_ERROR_INVALID_PARAM;
+		}
 
+		size_t username_len = strlen(username);
+		size_t password_len = strlen(password);
+
+		/* Validate username and password lengths */
+		if (username_len == 0 || username_len > 255)
+		{
+			snprintf(client->last_error, sizeof(client->last_error),
+					 "Username length must be between 1 and 255 characters");
+			return FTP_ERROR_INVALID_PARAM;
+		}
+		if (password_len == 0 || password_len > 255)
+		{
+			snprintf(client->last_error, sizeof(client->last_error),
+					 "Password length must be between 1 and 255 characters");
+			return FTP_ERROR_INVALID_PARAM;
+		}
+
+		char *new_username = strdup(username);
+		if (!new_username)
+		{
+			snprintf(client->last_error, sizeof(client->last_error), "Failed to allocate memory for username");
+			return FTP_ERROR_MEMORY;
+		}
+
+		char *new_password = strdup(password);
+		if (!new_password)
+		{
+			free(new_username);
+			snprintf(client->last_error, sizeof(client->last_error), "Failed to allocate memory for password");
+			return FTP_ERROR_MEMORY;
+		}
+
+		/* Free old credentials */
 		if (client->config.username)
 		{
 			free(client->config.username);
 		}
-		client->config.username = strdup(username);
-		if (!client->config.username)
-		{
-			return FTP_ERROR_MEMORY;
-		}
-
 		if (client->config.password)
 		{
 			free(client->config.password);
 		}
-		client->config.password = strdup(password);
-		if (!client->config.password)
-		{
-			free(client->config.username);
-			client->config.username = NULL;
-			return FTP_ERROR_MEMORY;
-		}
+
+		/* Set new credentials */
+		client->config.username = new_username;
+		client->config.password = new_password;
 
 		return FTP_OK;
 	}
@@ -1039,48 +1150,14 @@ extern "C"
 			return FTP_ERROR_INVALID_PARAM;
 		}
 
-		/* Reset curl handle to default state */
-		curl_easy_reset(client->curl);
+		struct curl_slist *commands = NULL;
+		commands = curl_slist_append(commands, "NOOP");
 
-		char url[FTP_MAX_URL_LENGTH];
-		int result = build_ftp_url(client, "/", url, sizeof(url));
-		if (result != FTP_OK)
-		{
-			snprintf(client->last_error, sizeof(client->last_error), "URL too long");
-			return result;
-		}
+		int result = ftp_client_execute_simple_command(client, commands, "Connection failed");
 
-		curl_easy_setopt(client->curl, CURLOPT_URL, url);
-		setup_curl_common(client);
+		curl_slist_free_all(commands);
 
-		/* Just list root to test connection */
-		ftp_memory_buffer_t buffer = {0};
-		curl_easy_setopt(client->curl, CURLOPT_WRITEFUNCTION, write_memory_callback);
-		curl_easy_setopt(client->curl, CURLOPT_WRITEDATA, &buffer);
-
-		CURLcode res = curl_easy_perform(client->curl);
-
-		if (buffer.data)
-		{
-			free(buffer.data);
-		}
-
-		if (res != CURLE_OK)
-		{
-			snprintf(client->last_error, sizeof(client->last_error), "Connection failed: %s", curl_easy_strerror(res));
-
-			if (res == CURLE_LOGIN_DENIED)
-			{
-				return FTP_ERROR_AUTH;
-			}
-			else if (res == CURLE_OPERATION_TIMEDOUT)
-			{
-				return FTP_ERROR_TIMEOUT;
-			}
-			return FTP_ERROR_CONNECTION;
-		}
-
-		return FTP_OK;
+		return result;
 	}
 
 	int ftp_client_upload(ftp_client_t *client, const char *local_path, const char *remote_path)
@@ -1097,12 +1174,49 @@ extern "C"
 			return FTP_ERROR_FILE_IO;
 		}
 
-		/* Get file size */
-		fseek(fp, 0L, SEEK_END);
-		int64_t file_size = ftell(fp);
-		fseek(fp, 0L, SEEK_SET);
+		/* Use cross-platform 64-bit file size functions */
+		int64_t file_size;
 
-		/* Reset curl handle to default state */
+#ifdef _MSC_VER
+		/* Windows specific 64-bit functions */
+		if (_fseeki64(fp, 0, SEEK_END) != 0)
+		{
+			fclose(fp);
+			snprintf(client->last_error, sizeof(client->last_error), "Cannot determine file size");
+			return FTP_ERROR_FILE_IO;
+		}
+		file_size = _ftelli64(fp);
+		if (_fseeki64(fp, 0, SEEK_SET) != 0)
+		{
+			fclose(fp);
+			snprintf(client->last_error, sizeof(client->last_error), "Cannot determine file size");
+			return FTP_ERROR_FILE_IO;
+		}
+#else
+		/* POSIX standard 64-bit functions */
+		if (fseeko(fp, 0, SEEK_END) != 0)
+		{
+			fclose(fp);
+			snprintf(client->last_error, sizeof(client->last_error), "Cannot determine file size");
+			return FTP_ERROR_FILE_IO;
+		}
+		off_t file_size_off = ftello(fp);
+		if (fseeko(fp, 0, SEEK_SET) != 0)
+		{
+			fclose(fp);
+			snprintf(client->last_error, sizeof(client->last_error), "Cannot determine file size");
+			return FTP_ERROR_FILE_IO;
+		}
+		file_size = (int64_t)file_size_off;
+#endif
+
+		if (file_size < 0)
+		{
+			fclose(fp);
+			snprintf(client->last_error, sizeof(client->last_error), "Cannot determine file size");
+			return FTP_ERROR_FILE_IO;
+		}
+
 		curl_easy_reset(client->curl);
 
 		char url[FTP_MAX_URL_LENGTH];
@@ -1248,10 +1362,17 @@ extern "C"
 			return FTP_ERROR_INVALID_PARAM;
 		}
 
+		size_t path_len = strlen(remote_path);
+		size_t cmd_len = 4 + path_len + 1;
+		if (cmd_len > 512)
+		{
+			snprintf(client->last_error, sizeof(client->last_error), "Path too long for MKD command");
+			return FTP_ERROR_INVALID_PARAM;
+		}
+
 		struct curl_slist *commands = NULL;
 		char cmd[512];
-		/* Ensure path is absolute (starts with /) */
-		snprintf(cmd, sizeof(cmd), "MKD %s%s", (remote_path[0] == '/') ? "" : "/", remote_path);
+		snprintf(cmd, sizeof(cmd), "MKD %s", remote_path);
 		commands = curl_slist_append(commands, cmd);
 
 		int result = ftp_client_execute_simple_command(client, commands, "Create directory failed");
@@ -1267,10 +1388,17 @@ extern "C"
 			return FTP_ERROR_INVALID_PARAM;
 		}
 
+		size_t path_len = strlen(remote_path);
+		size_t cmd_len = 4 + path_len + 1;
+		if (cmd_len > 512)
+		{
+			snprintf(client->last_error, sizeof(client->last_error), "Path too long for RMD command");
+			return FTP_ERROR_INVALID_PARAM;
+		}
+
 		struct curl_slist *commands = NULL;
 		char cmd[512];
-		/* Ensure path is absolute (starts with /) */
-		snprintf(cmd, sizeof(cmd), "RMD %s%s", (remote_path[0] == '/') ? "" : "/", remote_path);
+		snprintf(cmd, sizeof(cmd), "RMD %s", remote_path);
 		commands = curl_slist_append(commands, cmd);
 
 		int result = ftp_client_execute_simple_command(client, commands, "Remove directory failed");
@@ -1286,10 +1414,17 @@ extern "C"
 			return FTP_ERROR_INVALID_PARAM;
 		}
 
+		size_t path_len = strlen(remote_path);
+		size_t cmd_len = 5 + path_len + 1;
+		if (cmd_len > 512)
+		{
+			snprintf(client->last_error, sizeof(client->last_error), "Path too long for DELE command");
+			return FTP_ERROR_INVALID_PARAM;
+		}
+
 		struct curl_slist *commands = NULL;
 		char cmd[512];
-		/* Ensure path is absolute (starts with /) */
-		snprintf(cmd, sizeof(cmd), "DELE %s%s", (remote_path[0] == '/') ? "" : "/", remote_path);
+		snprintf(cmd, sizeof(cmd), "DELE %s", remote_path);
 		commands = curl_slist_append(commands, cmd);
 
 		int result = ftp_client_execute_simple_command(client, commands, "Delete file failed");
@@ -1305,11 +1440,22 @@ extern "C"
 			return FTP_ERROR_INVALID_PARAM;
 		}
 
+		size_t old_len = strlen(old_path);
+		size_t new_len = strlen(new_path);
+
+		size_t cmd1_len = 5 + old_len + 1;
+		size_t cmd2_len = 5 + new_len + 1;
+
+		if (cmd1_len > 512 || cmd2_len > 512)
+		{
+			snprintf(client->last_error, sizeof(client->last_error), "Path too long for RNFR/RNTO command");
+			return FTP_ERROR_INVALID_PARAM;
+		}
+
 		struct curl_slist *commands = NULL;
 		char cmd1[512], cmd2[512];
-		/* Ensure paths are absolute (start with /) */
-		snprintf(cmd1, sizeof(cmd1), "RNFR %s%s", (old_path[0] == '/') ? "" : "/", old_path);
-		snprintf(cmd2, sizeof(cmd2), "RNTO %s%s", (new_path[0] == '/') ? "" : "/", new_path);
+		snprintf(cmd1, sizeof(cmd1), "RNFR %s", old_path);
+		snprintf(cmd2, sizeof(cmd2), "RNTO %s", new_path);
 		commands = curl_slist_append(commands, cmd1);
 		commands = curl_slist_append(commands, cmd2);
 
@@ -1450,12 +1596,34 @@ extern "C"
 			{
 				curl_easy_cleanup(client->curl);
 			}
+
 			if (client->config.host)
+			{
+				size_t host_len = strlen(client->config.host);
+				if (host_len > 0)
+				{
+					volatile char *p = (volatile char *)memset(client->config.host, 0, host_len);
+					(void)p;
+				}
 				free(client->config.host);
+			}
+
 			if (client->config.username)
+			{
+				size_t username_len = strlen(client->config.username);
+				volatile char *p = (volatile char *)memset(client->config.username, 0, username_len);
+				(void)p;
 				free(client->config.username);
+			}
+
 			if (client->config.password)
+			{
+				size_t password_len = strlen(client->config.password);
+				volatile char *p = (volatile char *)memset(client->config.password, 0, password_len);
+				(void)p;
 				free(client->config.password);
+			}
+
 			free(client);
 		}
 	}
