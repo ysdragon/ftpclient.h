@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ftpclient VERSION 0.0.1 LANGUAGES C)
+project(ftpclient VERSION 0.1.0 LANGUAGES C)
 
 # Set C standard
 set(CMAKE_C_STANDARD 99)

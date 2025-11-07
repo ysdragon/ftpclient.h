@@ -1,5 +1,5 @@
 /*
- * ftpclient.h - v0.0.1 - Single Header FTP Client Library
+ * ftpclient.h - v0.1.0 - Single Header FTP Client Library
  *
  * A lightweight, easy-to-use FTP/FTPS client library for C/C++.
  * Built on top of libcurl with a simple, intuitive API.

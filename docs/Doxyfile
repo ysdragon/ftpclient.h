@@ -2,7 +2,7 @@
 
 # Project related configuration
 PROJECT_NAME           = "ftpclient.h"
-PROJECT_NUMBER         = "v0.0.1"
+PROJECT_NUMBER         = "v0.1.0"
 PROJECT_BRIEF          = "A lightweight, single-header FTP/FTPS client library for C/C++"
 PROJECT_LOGO           = 
 OUTPUT_DIRECTORY       = docs
